@@ -1,0 +1,391 @@
+#!/bin/bash 
+ 
+# searchCMT 
+#----------------------- 
+# Gets earthquake information from the locally stored CMT catalog 
+# Andrew Newman 
+# Tue Aug 28 17:04:50 EDT 2007 
+# V 2.1 updated Tue May 16 09:41:24 EDT 2023
+# V 2.1.1 updated Wed Jun 11 14:53:54 EDT 2025
+################################################################################# 
+# where the CMT database exists on the local system 
+CMTOLD=~/templates/gCMTS/FINALs.ndk
+CMTEND=`gawk 'NR%5==1 {print $2}' $CMTOLD | tail -1`
+MONURL=https://www.ldeo.columbia.edu/~gcmt/projects/CMT/catalog/NEW_MONTHLY
+QURL=https://www.ldeo.columbia.edu/~gcmt/projects/CMT/catalog/NEW_QUICK/qcmt.ndk 
+QCMT=qcmt.ndk 
+if [ $TMPDIR ] ;then   
+   USAGE=$TMPDIR/$$.usage 
+   FORMAT=$TMPDIR/$$.format 
+   TEMPCMT=$TMPDIR/$$.temp.cmt 
+   else 
+   USAGE=$$.usage 
+   FORMAT=$$.format 
+   TEMPCMT=$$.temp.cmt 
+fi 
+ 
+MAGMIN=-99.99 
+MAGMAX=99.99 
+DEPMIN=-10000 
+DEPMAX=10000 
+THISYEAR=`date -u +%Y`
+THISMO=`date -u +%m`
+THISDD=`date -u +%d`
+EYEAR=$THISYEAR
+EMO=$THISMO
+EDD=$THISDD
+ 
+# create a usage display that will be shown if command is run with no arguements 
+UL="\e[4m" # turns on underline 
+NM="\e[0m" #turns off underline 
+ printf "`basename $0` was originally developed by Andrew Newman (Georgia Institute of Technology). 
+ 
+Usage: `basename $0` [-R${UL}LONMIN/LONMAX/LATMIN/LATMAX${NM}] [-C${UL}CLON/CLAT/RAD${NM}] [-T${UL}SYEAR/SMO/SDAY/EYEAR/EMO/EDAY${NM}]  
+                 [-M${UL}MMIN/MMAX${NM}][-D${UL}DMIN/DMAX${NM}] [-F${UL}TPMIN/TPMAX/NPMIN/NPMAX${NM}] [-Q${UL}n${NM}] [-O${UL}n${NM}] [-N] 
+ 
+OPTIONS (Must use at least one option): 
+       -R     Rectangular search using LONMIN/LONMAX/LATMIN/LATMAX  
+       -C     Circular search using center LON/LAT and radius [deg]  
+       -T     Time of event where  S* and E* represent start and end year month and day  
+                (all are required if option is used)  
+       -M     Magnitude range with Mmin and Mmax  
+                (maximum limits will be rescaled to 0 and 9.9 if outside)  
+       -D     Depth range with DMIN and DMAX in km     
+       -F     Focal Solution Tension/Null axes [default 0/90/0/90] 
+                    Thrust events           T-axis 45-90 
+                    Strike-slip events   Null-axis 45-90  
+                    Normal events           T-axis <45 && N-axis <45    
+       -Q     Download and use the quick events file, '$QCMT', from cmt website.  
+               n= 
+	        1=use old '$QCMT' if exists locally, otherwise get new. 
+	        2=always get new '$QCMT'. Deleting old.  
+		   This option Will leave '$QCMT' file  where you ran `basename $0` 
+       -O     OUTPUT format: 
+               n= 
+                0=simple hypo format [default] 
+                a=psmeca A&R (-Sa in psmeca) 
+                c=psmeca     (-Sc in psmeca) 
+                m=psmeca     (-Sm in psmeca) 
+                1=full format (not very pretty) 
+       -N     no header  (leaves off any of the header lines which start with '#'  
+    OUTPUT Goes to STDOUT   
+ 
+    CAVEAT: regional searches do not work across poles of dateline 
+ 
+    EXAMPLE: Find all shallow thrust earthquakes greater tham M7 in Sumatra region between 12/25 and 12/31, 2004.  
+     Put the output in a format readable by psmeca using Aki & Richards format. 
+ 
+      %% `basename $0` -R90/100/0/15 -T2004/12/25/2004/12/31 -M7/9.9 -D0/40 -F45/90/0/90 -Oa 
+      same as:  
+      %% `basename $0` -R90/100/0/15 -T2004/12/25/2004 -M7 -D0/40 -F45 -Oa \n " > $USAGE   
+	              
+ if  [ ${#} -lt "1" ] ; then 
+   cat $USAGE  # display usage 
+   rm $USAGE 
+   exit 1 # exit with error after removing temp file 
+ fi 
+while getopts "R:C:T:M:D:F:Q:NO:" OPT 
+do 
+   case ${OPT} in 
+       R) LONMIN=`echo $OPTARG | gawk -F"/" '{if ($1>180) print $1-360; else print $1}'` 
+          LONMAX=`echo $OPTARG | gawk -F"/" '{if ($2>180) print $2-360; else print $2}'` 
+	  if [ `echo $LONMIN $LONMAX | gawk '$1>$2{print "bad"}'` ] ; then 
+	       echo "ERROR with '-R' option" 
+	       echo "   LONMIN must be lower than LONMAX. Exiting..." 
+	       rm $USAGE; exit 1 
+	  fi  
+          LATMIN=`echo $OPTARG | gawk -F"/" '{print $3}'` 
+          LATMAX=`echo $OPTARG | gawk -F"/" '{print $4}'` 
+  	  RSEARCH=1; # flag for rectangular search. 
+	  if [ `echo $LATMIN $LATMAX | gawk '$1>$2{print "bad"}'` ] ; then 
+	       echo "ERROR with '-R' option\n LATMIN must be lower than LATMAX" 
+	       rm $USAGE; exit 1 
+	  fi  
+        ;; 
+       C) CLON=`echo $OPTARG | gawk -F"/" '{if ($1>180) print $1-360; else print $1}'` 
+          CLAT=`echo $OPTARG | gawk -F"/" '{print $2}'` 
+          CRAD=`echo $OPTARG | gawk -F"/" '{print $3}'` 
+  	  CSEARCH=1; # flag for radial search, else do a rectangular search or over all locations 
+        ;; 
+       T) # use extremes if non-existant 
+            SYEAR=`echo $OPTARG | gawk -F"/" '{print $1}'` 
+             SMO=`echo $OPTARG | gawk -F"/" '{ if ( $2 ) print $2; else print "01"}'` 
+             SDD=`echo $OPTARG | gawk -F"/" '{ if ( $3 ) print $3; else print "01"}'` 
+	     EYEAR=`echo $THISYEAR"/"$OPTARG | gawk -F"/" '{ if ($5) print $5; else print $1}'`
+             EMO=`echo  $THISMO"/"$OPTARG | gawk -F"/" '{ if ( $6 ) print $6; else print $1}'`   
+             EDD=`echo $THISDD"/"$OPTARG | gawk -F"/" '{ if ( $7 ) print $7; else print $1}'`
+	    #check if dates are backwards 
+	    Sdate=`echo $SYEAR $SMO $SDD | gawk '{printf "%08d", $1*10000+$2*100+$3}'` 
+	    Edate=`echo $EYEAR $EMO $EDD | gawk '{printf "%08d", $1*10000+$2*100+$3}'` 
+	     SDATE=`echo $SYEAR $SMO $SDD | gawk '{print $1+($2-1)/12+($3-1)/365.25}'` 
+	     EDATE=`echo $EYEAR $EMO $EDD | gawk '{print $1+($2-1)/12+($3-1)/365.25}'` 
+	     if [ `echo $Sdate $Edate | gawk '$1>$2{print "bad"}'` ] ; then 
+	          echo "ERROR with '-T' option\n start time must be earlier than end time" 
+	          rm $USAGE; exit 1 
+	     fi  
+	  SYEARMODD=`echo $SYEAR $SMO $SDD | gawk '{printf "%04d/%02d/%02d", $1, $2,$3}'` 
+	  EYEARMODD=`echo $EYEAR $EMO $EDD | gawk '{printf "%04d/%02d/%02d", $1, $2,$3}'` 
+	     TSEARCH=1; # flag for time search, else search over all times 
+         ;; 
+       M) MwMIN=`echo $OPTARG | gawk -F"/" '{print $1}'` 
+          MwMAX=`echo $OPTARG | gawk -F"/" '{ if ( $2 ) print $2; else print "10.5"}'` 
+	  if [ `echo $MAGMIN $MAGMAX | gawk '$1>$2{print "bad"}'` ] ; then 
+	       echo "ERROR with '-M' option\n MAGMIN must be lower than MAGMAX" 
+	       rm $USAGE; exit 1 
+	  fi  
+  	  MwSEARCH=1; # flag for MomentMag search, else search over all magnitudes 
+         ;; 
+       D) DEPMIN=`echo $OPTARG | gawk -F"/" '{print $1}'` 
+          DEPMAX=`echo $OPTARG | gawk -F"/" '{ if ( $2 ) print $2; else print "9999.99"}'` 
+	  if [ `echo $DEPMIN $DEPMAX | gawk '$1>$2{print "bad"}'` ] ; then 
+	       echo "ERROR with '-D' option\n DEPMIN must be lower than DEPMAX" 
+	       rm $USAGE; exit 1 
+	  fi  
+  	  DepSEARCH=1; # flag for Depth search, else search over all depths 
+         ;; 
+       F) # use extremes if non-existant  
+          TPMIN=`echo $OPTARG | gawk -F"/" '{ if ( $1 ) print $1; else print "0"}'` 
+          TPMAX=`echo $OPTARG | gawk -F"/" '{ if ( $2 ) print $2; else print "90"}'` 
+          NPMIN=`echo $OPTARG | gawk -F"/" '{ if ( $3 ) print $3; else print "0"}'` 
+          NPMAX=`echo $OPTARG | gawk -F"/" '{ if ( $4 ) print $4; else print "90"}'` 
+	   
+  	  FSEARCH=1; # flag for Focal Mechanism search, else search over all Mechanisms 
+         ;; 
+       Q) GETQ=$OPTARG 
+         ;; 
+       N) NHEAD=1 
+		;; 
+       O) OUTPUT=$OPTARG 
+		;; 
+       *) echo "ERROR: unknown modifier flag used (${OPT}), exiting."  # if a bad modifier is used 
+           rm $USAGE;   exit 1 ;; # exit with error after removing temp file 
+   esac 
+done 
+rm $USAGE 
+ 
+###################################### 
+# Create full local file 
+###################################### 
+ CMTENDYEAR=`echo $CMTEND | awk -F"/" '{print $1}'`
+ CMTENDMO=`echo $CMTEND | awk -F"/" '{print $2}'`
+
+ if [ "$EYEAR" -ge "$THISYEAR" ] ; then
+	 EYEAR=$THISYEAR
+	 if [ "$EMO" -ge "$THISMO" ] ; then
+		 EMO=$THISMO
+	 fi
+ fi
+
+ if [ "$CMTENDYEAR" -le "$EYEAR" ] ; then
+	 FIRST="1"
+	 for year in `seq $CMTENDYEAR $EYEAR` 
+	 do
+     	    if [ "$year" -le "$EYEAR" ] ; then
+		yr=`echo $year | cut -c 3-`
+		nmo=0
+	 	for mon in jan feb mar apr may jun jul aug sep oct nov dec
+		do
+		   echo $(( ++nmo )) > /dev/null
+     	    	   if [ "$year" -eq "$CMTENDYEAR" ] && [ "$nmo" -le "$CMTENDMO" ] ; then
+			#echo "data for $year $mon already loaded"  1>&2
+			printf ""  1>&2  # do nothing
+     	    	   elif [ "$year" -eq "$EYEAR" ] && [ "$nmo" -gt "$EMO" ] ; then
+			#echo "data for $year $mon after end of search" 1>&2
+			printf ""  1>&2  # do nothing
+		   else
+	 		if [ $FIRST ] ; then
+			       	echo "Trying to update local database... may take a moment" 1>&2
+			fi
+			FIRST=""
+			monfile="${mon}$yr.ndk"
+			murl=$MONURL/$year/$monfile 
+			if curl --head --silent --fail -m 5 $murl 2>/dev/null ; then
+				echo "Downloading $murl" 1>&2
+			 	curl --silent -m 5 $murl >> $CMTOLD # 2>/dev/null
+			fi
+		   fi
+		done
+	     fi
+	 done
+ fi
+
+######################################
+# Make local copy that will be updated with quick slns possibly
+######################################
+ cp $CMTOLD  $TEMPCMT 
+###################################### 
+# Get new data 
+###################################### 
+if [ $GETQ ] ; then 
+    if [ "$GETQ" == "1" ] ; then 
+	if [ ! -e $QCMT ] ; then 
+	  if [ ! $NHEAD ]; then printf "# Retreiving Quick CMT..." ; fi 
+	   curl --silent $QURL -o $QCMT &>/dev/null 
+	  if [ ! $NHEAD ]; then printf "done!\n" ; fi 
+         else 
+	  if [ ! $NHEAD ]; then printf "# Including local Quick CMT file ($QCMT)\n" ; fi 
+        fi 
+     elif [ "$GETQ" == "2" ] ; then      
+	  if [ ! $NHEAD ]; then printf "# Retreiving Quick CMT..." ; fi 
+	   curl --silent -m 5 $QURL -o $QCMT &>/dev/null 
+	  if [ ! $NHEAD ]; then printf "done!\n" ; fi 
+     fi 
+	# merge files  
+	  LASTDATE=`tail -5 $TEMPCMT | head -1 | gawk 'BEGIN{FIELDWIDTHS="5 4 1 2 1 2 65"}{printf "%8.4f\n", $2+($4-1)/12+($6-1)/366}'` # last date of local store 
+	  NOREPEATLINE=`gawk 'BEGIN{FIELDWIDTHS="5 4 1 2 1 2 65"}{YR1=$2+($4-1)/12+($6-1)/366} 
+	                 {if (YR1>YR2 ) print NR}' YR2=$LASTDATE $QCMT | head -1` 
+	  gawk 'NR >= NRP' NRP=$NOREPEATLINE $QCMT  >> $TEMPCMT 
+else
+	echo "Last data in $CMTOLD is from $CMTENDYEAR/$CMTENDMO.  You may consider using the QUICK solutions (-Q flag). " 1>&2
+fi 
+ 
+################################################### 
+# TIMESEARCH 
+################################################### 
+if  [ $TSEARCH ] ; then       
+    # build temp cat for time needed 
+    if [ ! $NHEAD ]; then echo "# Searching on time  $SYEARMODD - $EYEARMODD" ; fi 
+        line1=`gawk 'BEGIN {FIELDWIDTHS="4 1 4 1 2 1 2 60"}{if ( NR%5==1 && ($3*10000+$5*100+$7)>=date) print NR}' date=$Sdate $TEMPCMT | head -1` 
+	if [ ! $line1 ] ; then 
+		echo "Sorry No data exists after $SYEARMODD.  Exiting..." 
+		rm $TEMPCMT 
+	       exit 1  
+	fi 
+        line2=`gawk 'BEGIN {FIELDWIDTHS="4 1 4 1 2 1 2 60"}{if ( NR%5==1 && ($3*10000+$5*100+$7)<=date) print NR+4}' date=$Edate $TEMPCMT | tail -1` 
+	if [ ! $line2 ] ; then 
+		line2=1e100 
+	fi 
+
+         gawk 'NR >=line1 && NR <=line2{if(NR%5==1) {print "\n"$0}else{print $0} }' line1=$line1 line2=$line2 $TEMPCMT |\
+         gawk 'BEGIN{FS="\n"; RS=""}{print $1$2$3$4$5}' > $TEMPCMT.2 
+else 
+         gawk '{if(NR%5==1) {print "\n"$0}else{print $0} }' $TEMPCMT |\
+         gawk 'BEGIN{ FS="\n"; RS=""}{print $1$2$3$4$5}'  > $TEMPCMT.2 
+fi 
+mv $TEMPCMT.2 $TEMPCMT 
+################################################### 
+# LOCATION SEARCH 
+################################################### 
+   # 1   2    3    4   5   6   7  8  9  
+   # ref Date Time Lat Lon Dep mb Ms Nar.Loc.  
+if [ $RSEARCH ] ; then   
+    if [ ! $NHEAD ]; then echo "# Searching on rectangular region  $LATMIN/$LATMAX $LONMIN/$LONMAX"; fi 
+                          #1 2  3  4 5 6 7 8 9  10 1112131415161718192021222324252627 282930313233343536373839 404142434445464748495051525354555657585960616263646566676869 
+   gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 16 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+         {if (LATMIN<=$30 && LATMAX>=$30 && LONMIN<=$32 && LONMAX>=$32) print $0}' LATMIN=$LATMIN LATMAX=$LATMAX LONMIN=$LONMIN LONMAX=$LONMAX $TEMPCMT > $TEMPCMT.2 
+	 mv $TEMPCMT.2 $TEMPCMT 
+elif [ $CSEARCH ]; then 
+    if [ ! $NHEAD ]; then echo "# Searching on circular region centered $CLON/$CLAT within $CRAD degrees"; fi 
+                          #1 2  3  4 5 6 7 8 9  10 1112131415161718192021222324252627 282930313233343536373839 404142434445464748495051525354555657585960616263646566676869 
+   gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 16 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+         {RAD=((($30-CLAT)**2+($32-CLON)**2)**.5)} 
+	 {if (CRAD>RAD) print $0}' CLAT=$CLAT CLON=$CLON CRAD=$CRAD $TEMPCMT > $TEMPCMT.2 
+	 mv $TEMPCMT.2 $TEMPCMT 
+fi 
+##################################################################### 
+printf " 
+# NDK format  (1 line form) 
+#    1   2  3  4   5   6   7-8  9   | 10,11   12-23   24,25   26,27      
+#    ref Dt Tm Lat Lon Dep Mag  Nar.|  CMT    invData CMTtype MRF  
+#                          7=mb Loc.| 10=flag 13-15:B 24:CMT  26:BOXHD 
+#                          8=Ms     | 11=name 17-19:S 25:1,2     TRIHD 
+#                                   |         21-23:M         27:halfDur 
+#   ----------------------------------------------------------------- 
+#   |28-36        37    38-40   |41   42-47      48-53     
+#   |CENTROID     Depth SLNtime |Exp  MT,err(1)  MT,err(2) 
+#   |29,30=Tm,err  FIX  38:O,S,Q|dyn  42,43=Mrr  48,49=Mrt 
+#   |31,32=Lt,err  FREE 40:time |-cm  44,45=Mtt  50,51=Mrp 
+#   |33,34=Ln,err  BDY          |     46,47=Mpp  52,53=Mtp 
+#   |35,36=Dp,err               |                          
+#   ----------------------------------------------------------------- 
+#   |54   55-63                  | 64       65-67     68-70     
+#   |Vers MT-egn (x10^exp)       | scal.Mo  NodPlane1 NodPlane2 
+#   |     55-57=1)val,plung,Azim | x10^exp  65=Str    68=Str   
+#   |     58-60=2)val,plung,Azim |          66=Dip    69=Dip   
+#   |     61-63=3)val,plung,Azim |          67=Rk     70=Rk    
+#  USE THE FOLLOWING WITH gawk to parse out what you need    
+#                         #1 2  3  4 5 6 7 8 9  1011 1213141516171819202122232425262728 293031323334353637383940 414243444546474849505152535455565758596061626364656667686970 
+#  gawk 'BEGIN{FIELDWIDTHS=\"4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5\"} 
+# 
+#\n" >  $FORMAT 
+################################################### 
+# Mw SEARCH 
+if [ $MwSEARCH ] ; then   
+    if [ ! $NHEAD ]; then echo "# Searching on Magnitude $MwMIN<=Mw<=$MwMAX"; fi 
+                          #1 2  3  4 5 6 7 8 9  1011 1213141516171819202122232425262728 293031323334353637383940 414243444546474849505152535455565758596061626364656667686970 
+   gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5"} 
+        {M0=$64*10**$41}   {Mw=2./3.*(log(M0)/2.303)-10.73} 
+        {if(MMIN<=Mw && MMAX>=Mw) print $0 }' MMIN=$MwMIN MMAX=$MwMAX $TEMPCMT >$TEMPCMT.2 
+   mv $TEMPCMT.2 $TEMPCMT 
+fi 
+################################################### 
+# Dep SEARCH 
+if [ $DepSEARCH ] ; then   
+    if [ ! $NHEAD ]; then echo "# Searching on Depth $DEPMIN<=Depth<=$DEPMAX"; fi 
+                          #1 2  3  4 5 6 7 8 9  1011 1213141516171819202122232425262728 293031323334353637383940 414243444546474849505152535455565758596061626364656667686970 
+   gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5"} 
+        {if(DMIN<=$35 && DMAX>=$35) print $0 }' DMIN=$DEPMIN DMAX=$DEPMAX $TEMPCMT >$TEMPCMT.2 
+   mv $TEMPCMT.2 $TEMPCMT 
+fi 
+ 
+################################################### 
+# Focal SEARCH 
+if [ $FSEARCH ] ; then   
+    if [ ! $NHEAD ]; then echo "# Searching on Focal Solution: T-axis $TPMIN<=plunge<=$TPMAX; Null $NPMIN<=plunge<=$NPMAX"; fi 
+                          #1 2  3  4 5 6 7 8 9  1011 1213141516171819202122232425262728 293031323334353637383940 414243444546474849505152535455565758596061626364656667686970 
+   gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5"} 
+        {if(TPMIN<=$56 && TPMAX>=$56 &&  NPMIN<=$59 && NPMAX>=$59 )  print $0 }' TPMIN=$TPMIN TPMAX=$TPMAX NPMIN=$NPMIN NPMAX=$NPMAX   $TEMPCMT >$TEMPCMT.2 
+   mv $TEMPCMT.2 $TEMPCMT 
+fi 
+######################################### 
+# OUTPUT 
+######################################### 
+if [[ $OUTPUT == "a" ]]; then 
+        if [ ! $NHEAD ]; then  
+	    echo "# OUTPUT=$OUTPUT (psmeca -Sa [A&R])" 
+	    echo "# ------------------------------------------------------------" 
+	    echo "# LONG     LAT  DEPTH STK DP  RKE   Mw     LONG   LAT  CMTNAME" 
+	    echo "# ------------------------------------------------------------" 
+        fi 
+        gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+        {M0=$64*10**$41}   {Mw=2./3.*(log(M0)/2.303)-10.73} 
+        {printf "%7.2f %6.2f %6.1f %3d %2d %4d %5.2f %7.2f %6.2f %15s\n", $33,$31,$35,$65,$66,$67,Mw,$33,$31,$11}' $TEMPCMT  
+   elif [[ $OUTPUT == "c" ]]; then 
+        if [ ! $NHEAD ]; then  
+	    echo "# OUTPUT=$OUTPUT (psmeca -Sc [CMT convention])" 
+	    echo "# ---------------------1--1----1---2--2----2----------------------------------" 
+	    echo "# LONG     LAT  DEPTH STK DP  RKE STK DP  RKE Mant. Exp   LONG    LAT  CMTNAME" 
+	    echo "# ----------------------------------------------------------------------------" 
+        fi 
+        gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+        {printf "%7.2f %6.2f %6.1f %3d %2d %4d %3d %2d %4d %5.2f  %2d %7.2f %6.2f %15s\n", $33,$31,$35,$65,$66,$67,$68,$69,$70,$64,$41,$33,$31,$11}' $TEMPCMT  
+   elif [[ $OUTPUT == "m" ]]; then 
+        if [ ! $NHEAD ]; then  
+	    echo "# OUTPUT=$OUTPUT (psmeca -Sm [CMT zero Trace])" 
+	    echo "# ---------------------------------------------------------------------------------" 
+	    echo "# LONG     LAT  DEPTH   Mrr   Mtt   Mff   Mrt   Mrf   Mtf Exp   LONG   LAT  CMTNAME" 
+	    echo "# ---------------------------------------------------------------------------------" 
+        fi 
+        gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+        {printf "%7.2f %6.2f %6.1f %5.2f %5.2f %5.2f %5.2f %5.2f %5.2f %2d %7.2f %6.2f %15s\n", $33,$31,$35,$42,$44,$46,$48,$50,$52,$41,$33,$31,$11}' $TEMPCMT  
+ 
+   elif [[ $OUTPUT == "1" ]]; then 
+          if [ ! $NHEAD ]; then  
+	    echo "# OUTPUT=$OUTPUT full" 
+	    cat $FORMAT 
+	  fi   
+	    cat $TEMPCMT 
+    else  # STANDARD FORMAT 
+          if [ ! $NHEAD ]; then  
+	    echo "# OUTPUT=0 (simple hypo format)" 
+	    echo "# -----------------------------------------------------------------------------" 
+	    echo "# DATE       TIME          LONG   LAT   DEPTH STK DP  RKE Mom      Mw   CMTNAME" 
+	    echo "# -----------------------------------------------------------------------------" 
+          fi 
+        gawk 'BEGIN{FIELDWIDTHS="4 11 11 7 8 6 4 4 25 1 15 3 3 5 4 3 3 5 4 3 3 5 4 5 2 7 5 12 6 4 7 5 8 5 6 5 5 2 1 14 2 7 6 7 6 7 6 7 6 7 6 7 6 3 8 3 4 8 3 4 8 3 4 8 4 3 5 4 3 5 " } 
+        {M0=$64*10**$41}   {Mw=2./3.*(log(M0)/2.303)-10.733333333} 
+        {printf "%10s %10s %7.2f %6.2f %6.1f %3d %2d %4d %7.1e %5.2f %15s\n", $2,$3,$33,$31,$35,$65,$66,$67,M0,Mw,$11}' $TEMPCMT  
+fi 
+ 
+rm $TEMPCMT $FORMAT 
+exit 0 
